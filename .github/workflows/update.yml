@@ -1,0 +1,215 @@
+name: Update ALL VPN
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Collect and check servers
+        run: |
+          python - <<'PY'
+          """ALL VPN: собирает публичные VPN-конфиги, проверяет и выдаёт две подписки.
+
+          out/sub.txt   - обычная подписка (до 50 лучших серверов)
+          out/white.txt - подписка для белых списков (мобильный интернет РФ)
+
+          Только стандартная библиотека Python 3.8+. Недоступные источники пропускаются.
+          """
+          import base64
+          import json
+          import os
+          import random
+          import socket
+          import sys
+          import time
+          from concurrent.futures import ThreadPoolExecutor
+          from urllib.parse import quote, urlparse
+          from urllib.request import Request, urlopen
+
+          GENERAL_SOURCES = [
+              "https://raw.githubusercontent.com/barry-far/V2ray-config/main/Splitted-By-Protocol/vless.txt",
+              "https://raw.githubusercontent.com/barry-far/V2ray-config/main/Splitted-By-Protocol/trojan.txt",
+              "https://raw.githubusercontent.com/barry-far/V2ray-config/main/Splitted-By-Protocol/vmess.txt",
+              "https://raw.githubusercontent.com/barry-far/V2ray-config/main/Splitted-By-Protocol/ss.txt",
+              "https://raw.githubusercontent.com/Epodonios/v2ray-configs/refs/heads/main/Sub1.txt",
+              "https://raw.githubusercontent.com/Epodonios/v2ray-configs/refs/heads/main/Sub2.txt",
+              "https://raw.githubusercontent.com/Epodonios/v2ray-configs/refs/heads/main/Sub3.txt",
+              "https://raw.githubusercontent.com/Epodonios/v2ray-configs/refs/heads/main/Sub4.txt",
+              "https://raw.githubusercontent.com/Epodonios/v2ray-configs/refs/heads/main/Sub5.txt",
+          ]
+
+          WHITE_SOURCES = [
+              "https://bitbucket.org/igareck/vpn-configs-for-russia/raw/main/Vless-Reality-White-Lists-Rus-Mobile.txt",
+              "https://bitbucket.org/igareck/vpn-configs-for-russia/raw/main/WHITE-CIDR-RU-all.txt",
+          ]
+
+          NAME = "ALL VPN"
+          MAX_OUT = 50          # серверов в каждой подписке
+          MAX_CANDIDATES = 4000  # сколько случайных кандидатов проверять
+          TIMEOUT = 3
+          THREADS = 200
+          SCHEMES = ("vless://", "vmess://", "trojan://", "ss://")
+
+
+          def fetch(url):
+              try:
+                  req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                  return urlopen(req, timeout=30).read().decode("utf-8", "ignore")
+              except Exception as e:
+                  print("не скачалось:", url, e, file=sys.stderr)
+                  return ""
+
+
+          def pad(s):
+              return s + "=" * (-len(s) % 4)
+
+
+          def decode_if_b64(text):
+              t = text.strip()
+              if any(s in t for s in SCHEMES):
+                  return t
+              try:
+                  return base64.b64decode(pad(t)).decode("utf-8", "ignore")
+              except Exception:
+                  return ""
+
+
+          def load(sources):
+              links = set()
+              for url in sources:
+                  got = 0
+                  for line in decode_if_b64(fetch(url)).splitlines():
+                      line = line.strip()
+                      if line.startswith(SCHEMES):
+                          links.add(line)
+                          got += 1
+                  print(f"{got:6d}  {url}")
+              return list(links)
+
+
+          def host_port(link):
+              if link.startswith("vmess://"):
+                  d = json.loads(base64.b64decode(pad(link[8:])))
+                  return d["add"], int(d["port"])
+              if link.startswith("ss://"):
+                  body = link[5:].split("#")[0]
+                  if "@" not in body:
+                      body = base64.urlsafe_b64decode(pad(body)).decode()
+                  u = urlparse("//" + body.split("@", 1)[1])
+                  return u.hostname, u.port
+              u = urlparse(link)
+              return u.hostname, u.port
+
+
+          def check(link):
+              """(задержка_мс, ссылка) или None, если порт не отвечает."""
+              try:
+                  host, port = host_port(link)
+                  if not host or not port:
+                      return None
+                  start = time.time()
+                  with socket.create_connection((host, port), timeout=TIMEOUT):
+                      pass
+                  return int((time.time() - start) * 1000), link
+              except Exception:
+                  return None
+
+
+          def rename(link, name):
+              """Меняет отображаемое имя сервера в клиенте."""
+              try:
+                  if link.startswith("vmess://"):
+                      d = json.loads(base64.b64decode(pad(link[8:])))
+                      d["ps"] = name
+                      return "vmess://" + base64.b64encode(
+                          json.dumps(d, ensure_ascii=False).encode()
+                      ).decode()
+                  return link.split("#")[0] + "#" + quote(name)
+              except Exception:
+                  return link
+
+
+          def pick(links, check_first=True):
+              """Оставляет лучшие серверы: уникальный host:port, самая малая задержка."""
+              random.shuffle(links)
+              links = links[:MAX_CANDIDATES]
+              with ThreadPoolExecutor(THREADS) as pool:
+                  alive = sorted(r for r in pool.map(check, links) if r)
+              print("проверено:", len(links), "| живых:", len(alive))
+              seen, result = set(), []
+              for ms, link in alive:
+                  try:
+                      hp = host_port(link)
+                  except Exception:
+                      continue
+                  if hp in seen:
+                      continue
+                  seen.add(hp)
+                  result.append((ms, link))
+                  if len(result) >= MAX_OUT:
+                      break
+              return result
+
+
+          def write(path, title, items):
+              lines = [
+                  f"#profile-title: {title}",
+                  "#profile-update-interval: 1",
+              ]
+              for i, (ms, link) in enumerate(items, 1):
+                  lines.append(rename(link, f"{NAME} {i} | {ms}ms"))
+              with open(path, "w", encoding="utf-8") as f:
+                  f.write("\n".join(lines) + "\n")
+              print("записано:", path, len(items))
+
+
+          def main():
+              os.makedirs("out", exist_ok=True)
+
+              print("== обычные ==")
+              general = pick(load(GENERAL_SOURCES))
+              if general:
+                  write("out/sub.txt", NAME, general)
+              else:
+                  print("обычная подписка пуста, файл не обновлён", file=sys.stderr)
+
+              print("== белые списки ==")
+              white_all = load(WHITE_SOURCES)
+              white = pick(list(white_all))
+              # Серверы белых списков могут быть недоступны с зарубежного раннера:
+              # если проверка оставила слишком мало, отдаём список без проверки.
+              if len(white) < 10 and white_all:
+                  random.shuffle(white_all)
+                  white = [(0, l) for l in white_all[:MAX_OUT]]
+                  print("мало живых, беру без проверки")
+              if white:
+                  write("out/white.txt", f"{NAME} (белые списки)", white)
+              else:
+                  print("список белых пуст, файл не обновлён", file=sys.stderr)
+
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+      - name: Publish to data branch
+        run: |
+          cd out
+          git init -q -b data
+          git config user.name "github-actions"
+          git config user.email "actions@users.noreply.github.com"
+          git add .
+          git commit -qm "update"
+          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" data
