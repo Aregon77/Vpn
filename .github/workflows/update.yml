@@ -11,11 +11,24 @@ permissions:
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Install mihomo (real server check)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download -R MetaCubeX/mihomo -p 'mihomo-linux-amd64-*.gz' -D /tmp/mh
+          f=$(ls /tmp/mh | grep -E '^mihomo-linux-amd64-v[0-9]+\.[0-9]+\.[0-9]+\.gz$' | head -1)
+          echo "using $f"
+          gunzip -c "/tmp/mh/$f" > /tmp/mihomo
+          chmod +x /tmp/mihomo
+          /tmp/mihomo -v
+          echo "MIHOMO_BIN=/tmp/mihomo" >> "$GITHUB_ENV"
 
       - name: Collect and check servers
         run: |
@@ -25,18 +38,26 @@ jobs:
           out/sub.txt   - обычная подписка (до 50 лучших серверов)
           out/white.txt - подписка для белых списков (мобильный интернет РФ)
 
-          Только стандартная библиотека Python 3.8+. Недоступные источники пропускаются.
+          Проверка в два этапа:
+            1. быстрая: отвечает ли порт сервера;
+            2. настоящая: через ядро mihomo (путь в переменной MIHOMO_BIN) каждый сервер
+               открывает https://www.gstatic.com/generate_204. Без mihomo остаётся этап 1.
+
+          Только стандартная библиотека Python 3.8+.
           """
           import base64
           import json
           import os
           import random
+          import shutil
           import socket
+          import subprocess
           import sys
+          import tempfile
           import time
           from concurrent.futures import ThreadPoolExecutor
           from urllib.parse import quote, urlparse
-          from urllib.request import Request, urlopen
+          from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
           GENERAL_SOURCES = [
               "https://raw.githubusercontent.com/barry-far/V2ray-config/main/Splitted-By-Protocol/vless.txt",
@@ -56,11 +77,17 @@ jobs:
           ]
 
           NAME = "ALL VPN"
-          MAX_OUT = 50          # серверов в каждой подписке
-          MAX_CANDIDATES = 4000  # сколько случайных кандидатов проверять
+          MAX_OUT = 50            # серверов в каждой подписке
+          MAX_CANDIDATES = 4000   # сколько случайных ссылок проверять по порту
+          MAX_VERIFY = 1000       # сколько из живых по порту проверять реальным запросом
           TIMEOUT = 3
           THREADS = 200
           SCHEMES = ("vless://", "vmess://", "trojan://", "ss://")
+
+          MIHOMO = os.environ.get("MIHOMO_BIN", "")
+          API = "127.0.0.1:19090"
+          TEST_URL = "https://www.gstatic.com/generate_204"
+          _local = build_opener(ProxyHandler({}))  # к локальному API без системных прокси
 
 
           def fetch(url):
@@ -141,26 +168,118 @@ jobs:
                   return link
 
 
-          def pick(links, check_first=True):
-              """Оставляет лучшие серверы: уникальный host:port, самая малая задержка."""
+          def tcp_filter(links):
+              """Живые по порту, уникальные по host:port, от быстрых к медленным."""
               random.shuffle(links)
               links = links[:MAX_CANDIDATES]
               with ThreadPoolExecutor(THREADS) as pool:
                   alive = sorted(r for r in pool.map(check, links) if r)
-              print("проверено:", len(links), "| живых:", len(alive))
+              print("порт открыт:", len(alive), "из", len(links))
+              # Дубли определяем по самой ссылке, а не по host:port: за одним адресом
+              # Cloudflare живут сотни разных конфигов.
               seen, result = set(), []
               for ms, link in alive:
-                  try:
-                      hp = host_port(link)
-                  except Exception:
+                  key = link.split("#")[0]
+                  if key in seen:
                       continue
-                  if hp in seen:
-                      continue
-                  seen.add(hp)
+                  seen.add(key)
                   result.append((ms, link))
-                  if len(result) >= MAX_OUT:
-                      break
               return result
+
+
+          def api(path, timeout=15):
+              with _local.open(f"http://{API}{path}", timeout=timeout) as r:
+                  return json.loads(r.read() or b"null")
+
+
+          def verify(items):
+              """Реальная проверка через mihomo. Возвращает [(задержка_мс, ссылка)] или None."""
+              if not MIHOMO or not os.path.exists(MIHOMO) or not items:
+                  return None
+              work = tempfile.mkdtemp()
+              proc = None
+              try:
+                  names, lines = {}, []
+                  for i, (_, link) in enumerate(items):
+                      n = f"n{i}"
+                      names[n] = link
+                      lines.append(rename(link, n))
+                  with open(os.path.join(work, "list.txt"), "w", encoding="utf-8") as f:
+                      f.write("\n".join(lines) + "\n")
+                  with open(os.path.join(work, "config.yaml"), "w", encoding="utf-8") as f:
+                      f.write(
+                          f"external-controller: {API}\n"
+                          "log-level: silent\n"
+                          "allow-lan: false\n"
+                          "ipv6: false\n"
+                          "proxy-providers:\n"
+                          "  src:\n"
+                          "    type: file\n"
+                          "    path: ./list.txt\n"
+                          "proxy-groups:\n"
+                          "  - name: G\n"
+                          "    type: select\n"
+                          "    use: [src]\n"
+                          "rules:\n"
+                          "  - MATCH,DIRECT\n"
+                      )
+                  proc = subprocess.Popen(
+                      [MIHOMO, "-d", work], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                  )
+                  for _ in range(60):
+                      try:
+                          api("/version", 2)
+                          break
+                      except Exception:
+                          if proc.poll() is not None:
+                              print("mihomo завершился при запуске", file=sys.stderr)
+                              return None
+                          time.sleep(0.5)
+                  else:
+                      print("mihomo не запустился", file=sys.stderr)
+                      return None
+
+                  loaded = [p["name"] for p in api("/providers/proxies/src")["proxies"]]
+                  loaded = [n for n in loaded if n in names]
+                  print("mihomo разобрал ссылок:", len(loaded), "из", len(items))
+
+                  url = quote(TEST_URL, safe="")
+
+                  def test(n):
+                      try:
+                          d = api(f"/proxies/{n}/delay?url={url}&timeout=6000", 10)
+                          return int(d["delay"]), names[n]
+                      except Exception:
+                          return None
+
+                  with ThreadPoolExecutor(100) as pool:
+                      ok = [r for r in pool.map(test, loaded) if r]
+                  print("прошли реальный запрос:", len(ok))
+                  return sorted(ok)
+              except Exception as e:
+                  print("проверка mihomo не удалась:", e, file=sys.stderr)
+                  return None
+              finally:
+                  if proc and proc.poll() is None:
+                      proc.terminate()
+                      try:
+                          proc.wait(5)
+                      except Exception:
+                          proc.kill()
+                  shutil.rmtree(work, ignore_errors=True)
+
+
+          def best(links):
+              """Лучшие серверы: реальная проверка, а при её отсутствии проверка порта."""
+              cands = tcp_filter(links)
+              # Для реальной проверки берём случайные, а не самые «быстрые» по порту:
+              # у серверов за Cloudflare порт отвечает за 1 мс, даже если конфиг мёртв.
+              pool = list(cands)
+              random.shuffle(pool)
+              real = verify(pool[:MAX_VERIFY])
+              if real is not None:
+                  return real[:MAX_OUT], True
+              return cands[:MAX_OUT], False
 
 
           def write(path, title, items):
@@ -179,7 +298,7 @@ jobs:
               os.makedirs("out", exist_ok=True)
 
               print("== обычные ==")
-              general = pick(load(GENERAL_SOURCES))
+              general, _ = best(load(GENERAL_SOURCES))
               if general:
                   write("out/sub.txt", NAME, general)
               else:
@@ -187,13 +306,13 @@ jobs:
 
               print("== белые списки ==")
               white_all = load(WHITE_SOURCES)
-              white = pick(list(white_all))
+              white, _ = best(list(white_all))
               # Серверы белых списков могут быть недоступны с зарубежного раннера:
               # если проверка оставила слишком мало, отдаём список без проверки.
               if len(white) < 10 and white_all:
                   random.shuffle(white_all)
                   white = [(0, l) for l in white_all[:MAX_OUT]]
-                  print("мало живых, беру без проверки")
+                  print("мало прошло проверку, беру без проверки")
               if white:
                   write("out/white.txt", f"{NAME} (белые списки)", white)
               else:
